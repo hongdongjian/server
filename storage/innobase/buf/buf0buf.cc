@@ -2158,38 +2158,23 @@ void buf_pool_t::watch_unset(const page_id_t id, buf_pool_t::hash_chain &chain)
 {
   mysql_mutex_assert_not_owner(&mutex);
   buf_page_t *w;
-  auto &hash_lock= page_hash.lock_get(chain);
-#ifndef NO_ELISION
-  if (xbegin())
   {
-    if (hash_lock.is_locked_or_waiting())
-      xabort();
+    transactional_lock_guard<page_hash_latch> g{page_hash.lock_get(chain)};
+    /* The page must exist because watch_set() did fix(). */
     w= page_hash.get(id, chain);
-    const auto state= w->state();
-    if (state != buf_page_t::UNFIXED + 1 ||
-        w < &watch[0] || w >= &watch[array_elements(watch)])
-    {
-      w->set_state(state - 1);
-      w= nullptr;
-    }
-    xend();
-  }
-  else
-#endif
-  {
-    hash_lock.lock();
-    /* The page must exist because watch_set() increments buf_fix_count. */
-    w= page_hash.get(id, chain);
-    const auto state= w->state();
-    ut_ad(state >= buf_page_t::UNFIXED);
-    ut_ad(~buf_page_t::LRU_MASK & state);
     ut_ad(w->in_page_hash);
-    if (state != buf_page_t::UNFIXED + 1 || !watch_is_sentinel(*w))
+    if (!watch_is_sentinel(*w))
     {
-      w->unfix();
+    no_watch:
+      ut_d(const auto s=) w->unfix();
+      ut_ad(~buf_page_t::LRU_MASK & s);
       w= nullptr;
     }
-    hash_lock.unlock();
+    const auto state= w->state();
+    ut_ad(~buf_page_t::LRU_MASK & state);
+    ut_ad(state >= buf_page_t::UNFIXED);
+    if (state != buf_page_t::UNFIXED + 1)
+      goto no_watch;
   }
 
   if (!w)
@@ -2200,25 +2185,9 @@ void buf_pool_t::watch_unset(const page_id_t id, buf_pool_t::hash_chain &chain)
   mysql_mutex_lock(&mutex);
   w= page_hash.get(id, chain);
 
-#ifndef NO_ELISION
-  if (xbegin())
   {
-    if (hash_lock.is_locked_or_waiting())
-      xabort();
-    auto f= w->state();
-    if (f == buf_page_t::UNFIXED && w == old)
-    {
-      page_hash.remove(chain, w);
-      w->set_state(buf_page_t::NOT_USED);
-    }
-    else
-      w->set_state(f - 1);
-    xend();
-  }
-  else
-#endif
-  {
-    hash_lock.lock();
+    transactional_lock_guard<page_hash_latch> g
+      {buf_pool.page_hash.lock_get(chain)};
     auto f= w->unfix();
     ut_ad(f < buf_page_t::READ_FIX || w != old);
 
@@ -2231,7 +2200,6 @@ void buf_pool_t::watch_unset(const page_id_t id, buf_pool_t::hash_chain &chain)
       ut_ad(!w->zip.data);
       w->set_state(buf_page_t::NOT_USED);
     }
-    hash_lock.unlock();
   }
 
   mysql_mutex_unlock(&mutex);
@@ -2258,39 +2226,18 @@ void buf_page_free(fil_space_t *space, uint32_t page, mtr_t *mtr)
   const page_id_t page_id(space->id, page);
   buf_pool_t::hash_chain &chain= buf_pool.page_hash.cell_get(page_id.fold());
   buf_block_t *block;
-  auto &hash_lock= buf_pool.page_hash.lock_get(chain);
-#ifndef NO_ELISION
-  if (xbegin())
   {
-    if (hash_lock.is_locked())
-      xabort();
+    transactional_shared_lock_guard<page_hash_latch> g
+      {buf_pool.page_hash.lock_get(chain)};
     block= reinterpret_cast<buf_block_t*>
       (buf_pool.page_hash.get(page_id, chain));
     if (!block || !block->page.frame)
-    {
-      xend();
-      return;
-    }
-    block->page.set_state(block->page.state() + 1);
-    xend();
-  }
-  else
-#endif
-  {
-    hash_lock.lock_shared();
-    block= reinterpret_cast<buf_block_t*>
-      (buf_pool.page_hash.get(page_id, chain));
-    if (!block || !block->page.frame)
-    {
       /* FIXME: convert ROW_FORMAT=COMPRESSED, without buf_zip_decompress() */
-      hash_lock.unlock_shared();
       return;
-    }
     /* To avoid a deadlock with buf_LRU_free_page() of some other page
     and buf_page_write_complete() of this page, we must not wait for a
-    page latch while holding a hash_lock. */
+    page latch while holding a page_hash latch. */
     block->page.fix();
-    hash_lock.unlock_shared();
   }
 
   block->page.lock.x_lock();
@@ -2619,28 +2566,7 @@ loop:
 	uint32_t state;
 
 	if (block) {
-#ifndef NO_ELISION
-		if (xbegin()) {
-			if (hash_lock.is_locked()) {
-				xabort();
-			}
-
-			if (buf_pool.is_uncompressed(block)
-			    && page_id == block->page.id()) {
-				state = block->page.state();
-				if ((state >= buf_page_t::FREED
-				     && state < buf_page_t::READ_FIX)
-				    || state >= buf_page_t::WRITE_FIX) {
-					block->page.set_state(state + 1);
-					xend();
-					goto got_block;
-				}
-			}
-			xend();
-			goto lock_elided;
-		}
-#endif
-		hash_lock.lock_shared();
+		transactional_shared_lock_guard<page_hash_latch> g{hash_lock};
 		if (buf_pool.is_uncompressed(block)
 		    && page_id == block->page.id()) {
 			ut_ad(!block->page.in_zip_hash);
@@ -2652,16 +2578,11 @@ loop:
 			     && state < buf_page_t::READ_FIX)
 			    || state >= buf_page_t::WRITE_FIX) {
 				state = block->page.fix();
-				hash_lock.unlock_shared();
 				goto got_block;
 			}
 		}
-		hash_lock.unlock_shared();
 	}
 
-#ifndef NO_ELISION
-lock_elided:
-#endif
 	guess = nullptr;
 
 	/* A memory transaction would frequently be aborted here. */
