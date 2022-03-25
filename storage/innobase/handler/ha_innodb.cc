@@ -21323,6 +21323,10 @@ static int wsrep_force_checkpoint(handlerton *hton, THD * thd)
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
   WSREP_DEBUG("Starting to flush dirty pages and checkpoint");
+  double dirty_pages_pct= srv_max_buf_pool_modified_pct;
+  double dirty_pages_pct_lwm= srv_max_dirty_pages_pct_lwm;
+
+  srv_max_buf_pool_modified_pct= srv_max_dirty_pages_pct_lwm= 0.0;
   // Note that wsrep_on = OFF during rsync SST so we can't check that
   // this is called only with WSREP(thd)
   // Force a dirty pages flush now
@@ -21332,8 +21336,9 @@ static int wsrep_force_checkpoint(handlerton *hton, THD * thd)
   // Force InnoDB to checkpoint
   ib::info() << "Creating checkpoint...";
   log_make_checkpoint();
-  log_sys.log.flush();
   ib::info() << "Creating checkpoint...done";
+  srv_max_buf_pool_modified_pct= dirty_pages_pct;
+  srv_max_dirty_pages_pct_lwm= dirty_pages_pct_lwm;
 
   return (0);
 }
