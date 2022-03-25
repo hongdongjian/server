@@ -749,11 +749,15 @@ row_rec_to_index_entry_impl(
 	if (mblob == 2) {
 		ut_ad(info_bits == REC_INFO_METADATA_ALTER
 		      || info_bits == REC_INFO_METADATA_ADD);
-		ut_ad(rec_len <= ulint(index->n_fields + got));
 		if (pad) {
+			ut_ad(rec_len <= ulint(index->n_fields + got));
 			rec_len = ulint(index->n_fields)
 				+ (info_bits == REC_INFO_METADATA_ALTER);
-		} else if (!got && info_bits == REC_INFO_METADATA_ALTER) {
+		} else if (got) {
+			rec_len = std::min(rec_len,
+					   ulint(index->n_fields + got));
+		} else if (info_bits == REC_INFO_METADATA_ALTER) {
+			ut_ad(rec_len <= index->n_fields);
 			rec_len++;
 		}
 	} else {
